@@ -111,6 +111,7 @@ type LocInput = { file: string; line: number; character: number }
 
 interface State {
   clients: LSPClient.Info[]
+  terraform: Map<LSPClient.Info, LSPServer.TerraformPoolStatus>
   servers: Record<string, LSPServer.Info>
   broken: Set<string>
   spawning: Map<string, Promise<LSPClient.Info | undefined>>
@@ -119,6 +120,7 @@ interface State {
 export interface Interface {
   readonly init: () => Effect.Effect<void>
   readonly status: () => Effect.Effect<Status[]>
+  readonly terraformPoolStatus?: () => Effect.Effect<LSPServer.TerraformPoolStatus[]>
   readonly hasClients: (file: string) => Effect.Effect<boolean>
   readonly touchFile: (input: string, diagnostics?: "document" | "full") => Effect.Effect<void>
   readonly diagnostics: () => Effect.Effect<Record<string, LSPClient.Diagnostic[]>>
@@ -151,7 +153,9 @@ const layer = Layer.effect(
         if (!cfg.lsp) {
           yield* Effect.logInfo("all LSPs are disabled")
         } else {
-          for (const server of Object.values(LSPServer)) {
+          for (const server of Object.values(LSPServer).filter(
+            (value): value is LSPServer.Info => typeof value === "object" && value !== null && "id" in value && "spawn" in value,
+          )) {
             servers[server.id] = server
           }
 
@@ -190,6 +194,7 @@ const layer = Layer.effect(
 
         const s: State = {
           clients: [],
+          terraform: new Map(),
           servers,
           broken: new Set(),
           spawning: new Map(),
@@ -234,12 +239,19 @@ const layer = Layer.effect(
             directory: ctx.directory,
             instance: ctx,
           }).catch(async () => {
-            s.broken.add(key)
             await Process.stop(handle.process)
+            s.broken.add(key)
             return undefined
           })
 
           if (!client) return undefined
+
+          if (server.id === "terraform") {
+            s.terraform.set(
+              client,
+              LSPServer.terraformPoolStatus(handle.process) ?? { mode: "direct", rootFingerprint: root, active: true },
+            )
+          }
 
           const existing = s.clients.find((x) => x.root === root && x.serverID === server.id)
           if (existing) {
@@ -252,6 +264,7 @@ const layer = Layer.effect(
         }
 
         for (const server of Object.values(s.servers)) {
+          if (!server?.extensions) continue
           if (server.extensions.length && !server.extensions.includes(extension)) continue
 
           const root = await server.root(file, ctx)
@@ -325,12 +338,21 @@ const layer = Layer.effect(
       return result
     })
 
+    const terraformPoolStatus = Effect.fn("LSP.terraformPoolStatus")(function* () {
+      const s = yield* InstanceState.get(state)
+      return s.clients.flatMap((client) => {
+        const status = s.terraform.get(client)
+        return status ? [status] : []
+      })
+    })
+
     const hasClients = Effect.fn("LSP.hasClients")(function* (file: string) {
       const ctx = yield* InstanceState.context
       const s = yield* InstanceState.get(state)
       return yield* Effect.promise(async () => {
         const extension = path.parse(file).ext || file
         for (const server of Object.values(s.servers)) {
+          if (!server?.extensions) continue
           if (server.extensions.length && !server.extensions.includes(extension)) continue
           const root = await server.root(file, ctx)
           if (!root) continue
@@ -480,6 +502,7 @@ const layer = Layer.effect(
     return Service.of({
       init,
       status,
+      terraformPoolStatus,
       hasClients,
       touchFile,
       diagnostics,

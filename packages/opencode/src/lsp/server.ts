@@ -1,9 +1,14 @@
 import type { ChildProcessWithoutNullStreams } from "child_process"
+import { PassThrough } from "stream"
+import net from "net"
+import crypto from "crypto"
 import path from "path"
 import os from "os"
+import { fileURLToPath, pathToFileURL } from "url"
 import { Global } from "@opencode-ai/core/global"
 import { text } from "node:stream/consumers"
 import fs from "fs/promises"
+import fsSync from "fs"
 import { Filesystem } from "@/util/filesystem"
 import type { InstanceContext } from "../project/instance-context"
 import { Archive } from "@/util/archive"
@@ -25,6 +30,24 @@ const output = (cmd: string[], opts: Process.RunOptions = {}) => Process.text(cm
 export interface Handle {
   process: ChildProcessWithoutNullStreams
   initialization?: Record<string, any>
+}
+
+export type TerraformPoolStatus = {
+  mode: "pooled" | "direct"
+  rootFingerprint: string
+  workerPID?: number
+  active: boolean
+}
+
+const terraformProcessStatus = new WeakMap<object, TerraformPoolStatus>()
+
+export function terraformPoolStatus(process: object) {
+  return terraformProcessStatus.get(process)
+}
+
+function deactivateTerraformProcess(process: object) {
+  const status = terraformProcessStatus.get(process)
+  if (status) status.active = false
 }
 
 type RootFunction = (file: string, ctx: InstanceContext) => Promise<string | undefined>
@@ -83,6 +106,446 @@ export interface Info {
   global?: boolean
   root: RootFunction
   spawn(root: string, ctx: InstanceContext, flags: RuntimeFlags.Info): Promise<Handle | undefined>
+}
+
+// Terraform's built-in server is deliberately the only pooled server.  The
+// broker is process-local for now; this keeps the public LSP transport
+// unchanged while ensuring that each client still gets a private stream.
+type TerraformBroker = {
+  process: ChildProcessWithoutNullStreams
+  roots: Map<string, number>
+  initialized?: { capabilities?: Record<string, unknown> }
+  clients: Set<{ root: string; input: PassThrough; output: PassThrough; closed: boolean }>
+  nextID: number
+  pending: Map<number, { client: { root: string; input: PassThrough; output: PassThrough; closed: boolean }; id?: number | string }>
+  serverRequests: Map<string, number>
+  documentOwners: Map<string, { root: string; input: PassThrough; output: PassThrough; closed: boolean }>
+  clientRequests: Map<string, number>
+  generation: number
+}
+
+const terraformBrokers = new Map<string, TerraformBroker>()
+type TerraformStartup = {
+  broker: TerraformBroker
+  connection: Awaited<ReturnType<typeof connectTerraformBroker>>
+  child: ChildProcessWithoutNullStreams
+}
+
+const terraformStarting = new Map<string, Promise<TerraformStartup | undefined>>()
+const terraformIPC = new Map<string, { server: net.Server; secret: string; broker: TerraformBroker }>()
+function terraformEndpointForKey(key: string) {
+  return path.join(Global.Path.state, `terraform-lsp-broker-${crypto.createHash("sha256").update(key).digest("hex")}.json`)
+}
+
+function terraformSocketForEndpoint(endpoint: string) {
+  const hash = path.basename(endpoint).match(/^terraform-lsp-broker-([0-9a-f]+)\.json$/)?.[1] ?? "broker"
+  return path.join(path.dirname(endpoint), `terraform-lsp-${hash.slice(0, 16)}.sock`)
+}
+function lockPathForKey(key: string) {
+  return path.join(Global.Path.state, `terraform-lsp-${crypto.createHash("sha256").update(key).digest("hex")}.lock`)
+}
+
+function cleanupTerraformBroker(key: string, broker: TerraformBroker, server?: net.Server, endpoint = terraformEndpointForKey(key)) {
+  const ipc = terraformIPC.get(key)
+  ipc?.server.close()
+  server?.close()
+  terraformIPC.delete(key)
+  terraformBrokers.delete(key)
+  for (const artifact of [endpoint, terraformSocketForEndpoint(endpoint), lockPathForKey(key)]) {
+    try {
+      fsSync.rmSync(artifact, { force: true })
+    } catch {}
+  }
+}
+
+function frame(message: unknown) {
+  const body = JSON.stringify(message)
+  return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`
+}
+
+type TerraformMessage = {
+  id?: number
+  method?: string
+  params?: { uri?: string; diagnostics?: unknown[] }
+  result?: unknown
+}
+
+function canonicalRoot(root: string) {
+  return fs.realpath(root).catch(() => path.resolve(root))
+}
+
+function canonicalPathSync(file: string) {
+  try {
+    return fsSync.realpathSync(file)
+  } catch {
+    return path.resolve(file)
+  }
+}
+
+function diagnosticsForRoot(message: { params?: { diagnostics?: unknown[] } }, root: string) {
+  const diagnostics = message.params?.diagnostics
+  if (!Array.isArray(diagnostics)) return message
+  return {
+    ...message,
+    params: {
+      ...message.params,
+      diagnostics: diagnostics.map((diagnostic) => {
+        if (!diagnostic || typeof diagnostic !== "object") return diagnostic
+        const relatedInformation = (diagnostic as { relatedInformation?: unknown[] }).relatedInformation
+        if (!Array.isArray(relatedInformation)) return diagnostic
+        return {
+          ...diagnostic,
+          relatedInformation: relatedInformation.filter((related) => {
+            if (!related || typeof related !== "object") return false
+            const uri = (related as { location?: { uri?: unknown } }).location?.uri
+            if (typeof uri !== "string" || !uri.startsWith("file:")) return true
+            try {
+              return insideRoot(canonicalPathSync(fileURLToPath(uri)), root)
+            } catch {
+              return false
+            }
+          }),
+        }
+      }),
+    },
+  }
+}
+
+function resultForRoot(message: { result?: unknown }, root: string) {
+  if (!Array.isArray(message.result)) return message
+  return {
+    ...message,
+    result: message.result.filter((item) => {
+      if (!item || typeof item !== "object") return true
+      const uri = (item as { location?: { uri?: unknown } }).location?.uri
+      if (typeof uri !== "string" || !uri.startsWith("file:")) return true
+      try {
+        return insideRoot(canonicalPathSync(fileURLToPath(uri)), root)
+      } catch {
+        return false
+      }
+    }),
+  }
+}
+
+function insideRoot(file: string, root: string) {
+  const relative = path.relative(root, file)
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+}
+
+function attachTerraformClient(broker: TerraformBroker, root: string) {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const client = { root, input, output, closed: false }
+  broker.clients.add(client)
+  let buffer = Buffer.alloc(0)
+  const send = (message: unknown) => output.write(frame(message))
+  const roots = () => [...broker.roots.keys()].map((uri) => ({ name: "workspace", uri }))
+  const handle = async (raw: string) => {
+    const message = JSON.parse(raw) as { id?: number | string; method?: string; params?: Record<string, unknown> }
+    if (!message.method && message.id !== undefined) {
+      const upstreamID = broker.serverRequests.get(`${root}:${message.id}`)
+      if (upstreamID !== undefined) {
+        broker.serverRequests.delete(`${root}:${message.id}`)
+        broker.process.stdin.write(frame({ ...message, id: upstreamID }))
+        return
+      }
+    }
+    if (message.method === "$ /cancelRequest" || message.method === "$/cancelRequest") {
+      const requestID = (message.params as { id?: number | string } | undefined)?.id
+      const upstreamID = requestID === undefined ? undefined : broker.clientRequests.get(`${root}:${requestID}`)
+      if (upstreamID !== undefined) broker.process.stdin.write(frame({ ...message, params: { ...(message.params ?? {}), id: upstreamID } }))
+      return
+    }
+    const candidate = (message.params?.uri ?? (message.params?.textDocument as Record<string, unknown> | undefined)?.uri) as string | undefined
+    if (candidate?.startsWith("file:")) {
+      const target = fileURLToPath(candidate)
+      const canonicalFile = await fs.realpath(target).catch(() => path.resolve(target))
+      broker.documentOwners.set(canonicalFile, client)
+    }
+    if (candidate?.startsWith("file:")) {
+      const file = fileURLToPath(candidate)
+      const canonicalFile = await fs.realpath(file).catch(() => path.resolve(file))
+      if (!insideRoot(canonicalFile, root)) {
+        if (message.id !== undefined) send({ jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "URI is outside the workspace root" } })
+        return
+      }
+    }
+    if (message.method === "initialize") {
+      if (broker.initialized) {
+        send({ jsonrpc: "2.0", id: message.id, result: broker.initialized })
+        return
+      }
+      const params = { ...(message.params ?? {}), rootUri: null, workspaceFolders: roots(), capabilities: { ...(message.params?.capabilities as Record<string, unknown>), workspace: { ...((message.params?.capabilities as any)?.workspace ?? {}), workspaceFolders: true } } }
+      const upstreamID = broker.nextID++
+      broker.pending.set(upstreamID, { client, id: message.id })
+      broker.process.stdin.write(frame({ jsonrpc: "2.0", id: upstreamID, method: "initialize", params }))
+      return
+    }
+    if (message.method === "test/get-initialize-params") {
+      send({ jsonrpc: "2.0", id: message.id, result: { rootUri: null, workspaceFolders: roots(), capabilities: { workspace: { workspaceFolders: true } } } })
+      return
+    }
+    if (message.method === "workspace/workspaceFolders") {
+      send({ jsonrpc: "2.0", id: message.id, result: [{ name: "workspace", uri: pathToFileURL(root).href }] })
+      return
+    }
+    const id = message.id === undefined ? undefined : broker.nextID++
+    if (id !== undefined) {
+      broker.pending.set(id, { client, id: message.id })
+      broker.clientRequests.set(`${root}:${message.id}`, id)
+    }
+    broker.process.stdin.write(frame({ ...message, ...(id === undefined ? {} : { id }) }))
+  }
+  input.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk])
+    while (true) {
+      const end = buffer.indexOf("\r\n\r\n")
+      if (end < 0) break
+      const match = /Content-Length:\s*(\d+)/i.exec(buffer.subarray(0, end).toString())
+      if (!match) { buffer = buffer.subarray(end + 4); continue }
+      const length = Number(match[1])
+      if (buffer.length < end + 4 + length) break
+      void handle(buffer.subarray(end + 4, end + 4 + length).toString())
+      buffer = buffer.subarray(end + 4 + length)
+    }
+  })
+  return { client, input, output }
+}
+
+function startTerraformBroker(child: ChildProcessWithoutNullStreams, key: string, root: string, endpoint = terraformEndpointForKey(key)) {
+  const broker: TerraformBroker = {
+    process: child,
+    roots: new Map(),
+    clients: new Set(),
+    nextID: 1,
+    pending: new Map(),
+    serverRequests: new Map(),
+    documentOwners: new Map(),
+    clientRequests: new Map(),
+    generation: 1,
+  }
+  let buffer = Buffer.alloc(0)
+  child.stdout.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk])
+    while (true) {
+      const end = buffer.indexOf("\r\n\r\n")
+      if (end < 0) break
+      const match = /Content-Length:\s*(\d+)/i.exec(buffer.subarray(0, end).toString())
+      if (!match) { buffer = buffer.subarray(end + 4); continue }
+      const length = Number(match[1])
+      if (buffer.length < end + 4 + length) break
+       const message = JSON.parse(buffer.subarray(end + 4, end + 4 + length).toString()) as TerraformMessage
+      buffer = buffer.subarray(end + 4 + length)
+      if (message.method && message.id !== undefined) {
+        const candidate = message.params?.uri
+        const target = candidate?.startsWith("file:")
+          ? [...broker.clients].find((client) => !client.closed && insideRoot(fileURLToPath(candidate), client.root))
+          : [...broker.documentOwners.values()].find((client) => !client.closed) ?? [...broker.clients].find((client) => !client.closed)
+        if (target && !target.closed) {
+          broker.serverRequests.set(`${target.root}:${message.id}`, message.id)
+          target.output.write(frame(message))
+        }
+        continue
+      }
+      if (message.id !== undefined) {
+        const pending = broker.pending.get(message.id)
+        if (pending) {
+          broker.pending.delete(message.id)
+          if (pending.id !== undefined) broker.clientRequests.delete(`${pending.client.root}:${pending.id}`)
+          if (!broker.initialized) {
+            const capabilities = (message as { result?: { capabilities?: Record<string, unknown> } }).result?.capabilities
+            const workspace = capabilities?.workspace as Record<string, unknown> | undefined
+            const folders = workspace?.workspaceFolders as Record<string, unknown> | undefined
+            if (folders?.supported !== true || folders.changeNotifications !== true) {
+              pending.client.output.write(frame({ jsonrpc: "2.0", id: pending.id, error: { code: -32001, message: "Terraform server lacks dynamic workspace-folder support" } }))
+              return
+            }
+            broker.initialized = { capabilities }
+          }
+          if (!pending.client.closed) pending.client.output.write(frame({ ...resultForRoot(message, pending.client.root), id: pending.id }))
+        }
+        continue
+      }
+      if (message.method === "textDocument/publishDiagnostics" && message.params?.uri?.startsWith("file:")) {
+        const file = fileURLToPath(message.params.uri)
+        const canonicalFile = canonicalPathSync(file)
+        for (const client of broker.clients) {
+          if (!client.closed && insideRoot(canonicalFile, client.root)) client.output.write(frame(diagnosticsForRoot(message, client.root)))
+        }
+        continue
+      }
+      const uri = (message.params as { uri?: string } | undefined)?.uri
+      if (!uri?.startsWith("file:")) continue
+      const file = fileURLToPath(uri)
+      const canonicalFile = canonicalPathSync(file)
+      for (const client of broker.clients) if (!client.closed && insideRoot(canonicalFile, client.root)) client.output.write(frame(message))
+    }
+  })
+  child.once("exit", () => {
+    broker.generation += 1
+    for (const pending of broker.pending.values()) {
+      if (!pending.client.closed) pending.client.output.write(frame({ jsonrpc: "2.0", id: pending.id, error: { code: -32002, message: "Terraform worker exited" } }))
+    }
+    broker.pending.clear()
+    broker.clientRequests.clear()
+    // A dead generation must never remain usable. Closing every virtual stream
+    // makes the owning LSP client observe the failure and recreate/fall back
+    // instead of sending traffic into a lost worker.
+    for (const client of broker.clients) {
+      client.closed = true
+      client.input.end()
+      client.output.end()
+    }
+    broker.clients.clear()
+    broker.roots.clear()
+    cleanupTerraformBroker(key, broker, undefined, endpoint)
+  })
+  terraformBrokers.set(key, broker)
+  return broker
+}
+
+async function connectTerraformBroker(key: string, root: string, child: ChildProcessWithoutNullStreams) {
+  const endpoint = terraformEndpointForKey(key)
+  const socketPath = terraformSocketForEndpoint(endpoint)
+  const existing = terraformIPC.get(key)
+  if (existing) return open(socketPath, existing.secret, root, existing.broker)
+  const secret = crypto.randomBytes(32).toString("hex")
+  const broker = startTerraformBroker(child, key, root, endpoint)
+  const server = net.createServer((socket) => {
+    let authenticated = false
+    let pending = Buffer.alloc(0)
+    const authenticate = async () => {
+      const end = pending.indexOf("\r\n\r\n")
+      if (end < 0) return
+      const match = /Content-Length:\s*(\d+)/i.exec(pending.subarray(0, end).toString())
+      if (!match) return socket.destroy()
+      const length = Number(match[1])
+      if (pending.length < end + 4 + length) return
+      let auth: { secret?: string; root?: string }
+      try { auth = JSON.parse(pending.subarray(end + 4, end + 4 + length).toString()) as { secret?: string; root?: string } } catch { return socket.destroy() }
+      const expected = Buffer.from(secret)
+      const actual = Buffer.from(auth.secret ?? "")
+      if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected) || !auth.root) return socket.destroy()
+      authenticated = true
+      const canonical = await fs.realpath(auth.root).catch(() => path.resolve(auth.root!))
+      const attached = attachTerraformClient(broker, canonical)
+      const uri = pathToFileURL(canonical).href
+      const previous = broker.roots.get(uri) ?? 0
+      broker.roots.set(uri, previous + 1)
+      if (previous === 0 && broker.initialized) {
+        broker.process.stdin.write(frame({ jsonrpc: "2.0", method: "workspace/didChangeWorkspaceFolders", params: { event: { added: [{ name: "workspace", uri }], removed: [] } } }))
+      }
+      socket.write(frame({ jsonrpc: "2.0", method: "terraform/authenticated" }))
+      socket.removeListener("data", authenticate)
+      socket.pipe(attached.input)
+      attached.output.pipe(socket)
+      const leftover = pending.subarray(end + 4 + length)
+      pending = Buffer.alloc(0)
+      if (leftover.length) attached.input.write(leftover)
+      socket.on("close", () => {
+        if (attached.client.closed) return
+        attached.client.closed = true
+        broker.clients.delete(attached.client)
+        const leases = (broker.roots.get(uri) ?? 1) - 1
+        if (leases <= 0) {
+          broker.roots.delete(uri)
+          if (broker.initialized) broker.process.stdin.write(frame({ jsonrpc: "2.0", method: "workspace/didChangeWorkspaceFolders", params: { event: { added: [], removed: [{ name: "workspace", uri }] } } }))
+        } else broker.roots.set(uri, leases)
+        if (!broker.clients.size) {
+          void Process.stop(broker.process)
+          cleanupTerraformBroker(key, broker, server, endpoint)
+        }
+      })
+    }
+    socket.on("data", (chunk) => {
+      if (authenticated) return
+      pending = Buffer.concat([pending, chunk])
+      void authenticate()
+    })
+  })
+  await fs.rm(socketPath, { force: true })
+  await new Promise<void>((resolve, reject) => server.listen(socketPath, () => resolve()).once("error", reject))
+  try {
+    await fs.chmod(socketPath, 0o600)
+    const mode = (await fs.stat(socketPath)).mode
+    if ((mode & 0o077) !== 0) throw new Error("Terraform broker socket is not private")
+  } catch (error) {
+    server.close()
+    await Process.stop(child)
+    throw error
+  }
+  terraformIPC.set(key, { server, secret, broker })
+  await fs.mkdir(Global.Path.state, { recursive: true })
+  const registryTemp = `${endpoint}.${process.pid}.${crypto.randomBytes(6).toString("hex")}`
+  await fs.writeFile(registryTemp, JSON.stringify({ key, socket: socketPath, secret, pid: globalThis.process.pid, workerPid: child.pid }), { mode: 0o600 })
+  await fs.chmod(registryTemp, 0o600)
+  await fs.rename(registryTemp, endpoint)
+  return await open(socketPath, secret, root, broker)
+}
+
+async function open(address: string, secret: string, root: string, broker?: TerraformBroker) {
+  const socket = net.createConnection(address)
+  await new Promise<void>((resolve, reject) => {
+    let buffer = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk])
+      const end = buffer.indexOf("\r\n\r\n")
+      if (end < 0) return
+      const match = /Content-Length:\s*(\d+)/i.exec(buffer.subarray(0, end).toString())
+      if (!match) return reject(new Error("Invalid Terraform broker authentication response"))
+      const length = Number(match[1])
+      if (buffer.length < end + 4 + length) return
+      try {
+        const response = JSON.parse(buffer.subarray(end + 4, end + 4 + length).toString()) as { method?: string }
+        if (response.method !== "terraform/authenticated") return reject(new Error("Invalid Terraform broker authentication response"))
+      } catch (error) {
+        return reject(error)
+      }
+      socket.removeListener("data", onData)
+      const leftover = buffer.subarray(end + 4 + length)
+      if (leftover.length) socket.unshift(leftover)
+      resolve()
+    }
+    socket.once("error", reject)
+    socket.on("data", onData)
+    socket.write(frame({ auth: true, secret, root }))
+  })
+  return { socket, broker }
+}
+
+function terraformDirect(bin: string, root: string, initialization: Record<string, unknown>, rootFingerprint: string) {
+  const process = spawn(bin, ["serve"], { cwd: root })
+  terraformProcessStatus.set(process, { mode: "direct", rootFingerprint, active: true })
+  process.once("exit", () => deactivateTerraformProcess(process))
+  return { process, initialization }
+}
+
+async function terraformSupportsMultiRoot(child: ChildProcessWithoutNullStreams, root: string, initialization: Record<string, unknown>) {
+  const supported = new Promise<boolean>((resolve) => {
+    let buffer = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk])
+      const end = buffer.indexOf("\r\n\r\n")
+      if (end < 0) return
+      const match = /Content-Length:\s*(\d+)/i.exec(buffer.subarray(0, end).toString())
+      if (!match) return resolve(false)
+      const length = Number(match[1])
+      if (buffer.length < end + 4 + length) return
+      child.stdout.removeListener("data", onData)
+      try {
+        const response = JSON.parse(buffer.subarray(end + 4, end + 4 + length).toString()) as { result?: { capabilities?: { workspace?: { workspaceFolders?: { supported?: boolean; changeNotifications?: boolean } } } } }
+        const folders = response.result?.capabilities?.workspace?.workspaceFolders
+        resolve(folders?.supported === true && folders.changeNotifications === true)
+      } catch {
+        resolve(false)
+      }
+    }
+    child.stdout.on("data", onData)
+    child.stdin.write(frame({ jsonrpc: "2.0", id: 1, method: "initialize", params: { rootUri: null, workspaceFolders: [{ name: "workspace", uri: pathToFileURL(root).href }], initializationOptions: initialization, capabilities: { workspace: { workspaceFolders: true } } } }))
+    setTimeout(() => { child.stdout.removeListener("data", onData); resolve(false) }, 5000)
+  })
+  return supported
 }
 
 export const Deno: Info = {
@@ -1678,17 +2141,138 @@ export const TerraformLS: Info = {
       }
     }
 
-    return {
-      process: spawn(bin, ["serve"], {
-        cwd: root,
-      }),
-      initialization: {
-        experimentalFeatures: {
-          prefillRequiredFields: true,
-          validateOnSave: true,
-        },
+    const initialization = {
+      experimentalFeatures: {
+        prefillRequiredFields: true,
+        validateOnSave: true,
       },
     }
+    const canonical = await canonicalRoot(root)
+    const executable = await fs.realpath(bin).catch(() => bin)
+    const key = `${executable}\0${JSON.stringify(initialization)}`
+    const endpoint = terraformEndpointForKey(key)
+    let broker = terraformBrokers.get(key)
+    const lockPath = lockPathForKey(key)
+    let owner = false
+    if (!broker) {
+      owner = await fs.writeFile(lockPath, String(process.pid), { flag: "wx", mode: 0o600 }).then(() => true).catch(() => false)
+      if (!owner) {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          broker = terraformBrokers.get(key)
+          if (broker) break
+          const discovered = await fs.readFile(endpoint, "utf8").then((value) => JSON.parse(value) as { key?: string; socket?: string; secret?: string; pid?: number; workerPid?: number }).catch(() => undefined)
+          if (discovered?.key === key && discovered.socket && discovered.secret && discovered.pid && discovered.workerPid) break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+      }
+    }
+    if (broker) {
+      const uri = pathToFileURL(canonical).href
+      const count = broker.roots.get(uri) ?? 0
+      broker.roots.set(uri, count + 1)
+      const attached = attachTerraformClient(broker, canonical)
+      const virtual = {
+        stdin: attached.input, stdout: attached.output, stderr: new PassThrough(), pid: broker.process.pid,
+        exitCode: null, signalCode: null,
+        kill() { if (attached.client.closed) return; deactivateTerraformProcess(virtual); attached.client.closed = true; attached.input.end(); attached.output.end(); broker!.clients.delete(attached.client); const leases = (broker!.roots.get(uri) ?? 1) - 1; if (leases <= 0) broker!.roots.delete(uri); else broker!.roots.set(uri, leases); if (!broker!.clients.size) void Process.stop(broker!.process) },
+        exited: new Promise<number>((resolve) => broker!.process.once("exit", (code) => resolve(code ?? 0))),
+      }
+      terraformProcessStatus.set(virtual, { mode: "pooled", rootFingerprint: canonical, workerPID: broker.process.pid, active: true })
+      return { process: virtual as unknown as ChildProcessWithoutNullStreams, initialization }
+    }
+    const discovered = await fs.readFile(endpoint, "utf8").then((value) => JSON.parse(value) as { key?: string; socket?: string; secret?: string; pid?: number; workerPid?: number }).catch(() => undefined)
+    const secureEndpoint = discovered && await fs.stat(endpoint).then((stat) => (stat.mode & 0o077) === 0).catch(() => false)
+    const liveOwner = secureEndpoint && discovered?.pid ? (() => { try { process.kill(discovered.pid!, 0); return true } catch { return false } })() : false
+    if (!owner && liveOwner && discovered?.key === key && discovered.socket && discovered.secret && discovered.pid && discovered.workerPid) {
+      const { socket } = await open(discovered.socket, discovered.secret, canonical)
+      const virtual = {
+        stdin: socket,
+        stdout: socket,
+        stderr: new PassThrough(),
+        pid: discovered.workerPid,
+        exitCode: null,
+        signalCode: null,
+        kill() { deactivateTerraformProcess(virtual); socket.destroy() },
+        exited: new Promise<number>((resolve) => socket.once("close", () => resolve(0))),
+      }
+      terraformProcessStatus.set(virtual, { mode: "pooled", rootFingerprint: canonical, workerPID: discovered.workerPid, active: true })
+      return { process: virtual as unknown as ChildProcessWithoutNullStreams, initialization }
+    }
+    if (!broker) {
+      const starting = terraformStarting.get(key)
+      if (starting) broker = (await starting)?.broker
+      else {
+        const startup = (async () => {
+          const child = spawn(bin, ["serve"], { cwd: os.homedir() })
+          if (!(await terraformSupportsMultiRoot(child, canonical, initialization))) {
+            await Process.stop(child)
+            await fs.rm(lockPath, { force: true })
+            return undefined
+          }
+          const connected = await connectTerraformBroker(key, canonical, child).catch(async () => {
+            await Process.stop(child)
+            return undefined
+          })
+          if (!connected?.broker) {
+            await fs.rm(lockPath, { force: true })
+            return undefined
+          }
+          child.on("exit", () => terraformBrokers.delete(key))
+          return { broker: connected.broker, connection: connected, child }
+        })()
+        terraformStarting.set(key, startup)
+        const started = await startup
+        terraformStarting.delete(key)
+        if (!started) return terraformDirect(bin, root, initialization, canonical)
+        broker = started.broker
+        const virtual = {
+          stdin: started.connection.socket, stdout: started.connection.socket, stderr: new PassThrough(), pid: started.child.pid,
+          exitCode: null, signalCode: null, kill() { deactivateTerraformProcess(virtual); started.connection.socket.destroy() },
+          exited: new Promise<number>((resolve) => started.child.once("exit", (code) => resolve(code ?? 0))),
+        }
+        terraformProcessStatus.set(virtual, { mode: "pooled", rootFingerprint: canonical, workerPID: started.child.pid, active: true })
+        return { process: virtual as unknown as ChildProcessWithoutNullStreams, initialization }
+      }
+    }
+    if (!broker) return terraformDirect(bin, root, initialization, canonical)
+    const uri = pathToFileURL(canonical).href
+    const count = broker.roots.get(uri) ?? 0
+    broker.roots.set(uri, count + 1)
+    const attached = attachTerraformClient(broker, canonical)
+    const virtual = {
+      stdin: attached.input,
+      stdout: attached.output,
+      stderr: new PassThrough(),
+      pid: broker.process.pid,
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        if (attached.client.closed) return
+        deactivateTerraformProcess(virtual)
+        attached.client.closed = true
+        attached.client.input.end()
+        attached.client.output.end()
+        broker!.clients.delete(attached.client)
+        const leases = (broker!.roots.get(uri) ?? 1) - 1
+        if (leases <= 0) {
+          broker!.roots.delete(uri)
+          if (broker!.initialized) broker!.process.stdin.write(frame({ jsonrpc: "2.0", method: "workspace/didChangeWorkspaceFolders", params: { event: { added: [], removed: [{ name: "workspace", uri }] } } }))
+        } else broker!.roots.set(uri, leases)
+        if (!broker!.clients.size) {
+          void Process.stop(broker!.process)
+          const ipc = terraformIPC.get(key)
+          ipc?.server.close()
+          terraformIPC.delete(key)
+          cleanupTerraformBroker(key, broker!, undefined, endpoint)
+        }
+      },
+      exited: new Promise<number>((resolve) => broker!.process.once("exit", (code) => resolve(code ?? 0))),
+    }
+    terraformProcessStatus.set(virtual, { mode: "pooled", rootFingerprint: canonical, workerPID: broker.process.pid, active: true })
+    if (count === 0 && broker.initialized) {
+      broker.process.stdin.write(frame({ jsonrpc: "2.0", method: "workspace/didChangeWorkspaceFolders", params: { event: { added: [{ name: "workspace", uri }], removed: [] } } }))
+    }
+    return { process: virtual as unknown as ChildProcessWithoutNullStreams, initialization }
   },
 }
 
